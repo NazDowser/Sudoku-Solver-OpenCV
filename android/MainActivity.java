@@ -1,5 +1,7 @@
 package com.ece420.lab7;
-
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.Manifest;
@@ -26,6 +28,8 @@ import org.opencv.core.Rect2d;
 import org.opencv.core.Scalar;
 import org.opencv.imgproc.Imgproc;
 import org.opencv.core.Size;
+import org.opencv.core.MatOfPoint;
+import org.opencv.core.MatOfPoint2f;
 import org.opencv.tracking.TrackerKCF;
 
 public class MainActivity extends AppCompatActivity implements CameraBridgeViewBase.CvCameraViewListener2 {
@@ -44,7 +48,8 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
     // Mat to store RGBA and Grayscale camera preview frame
     private Mat mRgba;
     private Mat mGray;
-    private Mat imgThresh;
+    private Mat imgDisplay;
+    private Mat temp;
 
     // KCF Tracker variables
 //    private TrackerKCF myTacker;
@@ -190,18 +195,114 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
     }
 
     public void filtering(Mat img) {
-        Mat imgMedian = new Mat(img.rows(), img.cols(), img.type());
-        Mat imgGaussian = new Mat(img.rows(), img.cols(), img.type());
-//        Mat imgThresh = new Mat(img.rows(), img.cols(), img.type());
+        Mat imgMedian = new Mat(mGray.rows(), mGray.cols(), mGray.type());
+        Mat imgGaussian = new Mat(mGray.rows(), mGray.cols(), mGray.type());
+        imgDisplay = new Mat(mGray.rows(), mGray.cols(), mGray.type());
         //Applying GaussianBlur on the Image
-        Imgproc.medianBlur(img, imgMedian,1);
+        Imgproc.medianBlur(mGray, imgMedian,1);
         Imgproc.GaussianBlur(imgMedian, imgGaussian, new Size(3, 3), 0);
-        Imgproc.adaptiveThreshold(imgGaussian, mGray, 255, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, 301, 7);
+        Imgproc.adaptiveThreshold(imgGaussian, imgDisplay, 255, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, 11, 7);
         imgMedian.release();
         imgGaussian.release();
-//        return imgThresh;
+        return;
     }
 
+    public void coordinateUnpack(Point[] rect, Point[] sorted) {
+        double min = 9999.;
+        double max = 0.;
+        for(int i=0; i<4; i++){
+            double sum = rect[i].x + rect[i].y;
+            if(sum < min){
+                sorted[0] = rect[i]; // top left
+                min = sum;
+            }
+            if(sum > max) {
+                sorted[3] = rect[i];// bottom right
+                max = sum;
+            }
+        }
+        min = 9999.;
+        max = 0.;
+        for(int i=0; i<4; i++){
+            double diff = rect[i].y - rect[i].x;
+            if(diff < min){
+                sorted[1] = rect[i]; //  top right
+                min = diff;
+            }
+            if(diff > max) {
+                sorted[2] = rect[i];// bottom left
+                max = diff;
+            }
+        }
+        return;
+    }
+
+    public void harmongraphyMatrix(Mat img, Point[] coordinates) {
+        double w1 = (int)Math.sqrt(Math.pow(coordinates[0].x - coordinates[1].x, 2) + Math.pow(coordinates[0].y - coordinates[1].y, 2));
+        double w2 = (int)Math.sqrt(Math.pow(coordinates[2].x - coordinates[3].x, 2) + Math.pow(coordinates[2].y - coordinates[3].y, 2));
+        double width = Math.max(w1, w2);
+
+        double h1 = (int)Math.sqrt(Math.pow(coordinates[0].x - coordinates[2].x, 2) + Math.pow(coordinates[0].y - coordinates[2].y, 2));
+        double h2 = (int)Math.sqrt(Math.pow(coordinates[1].x - coordinates[3].x, 2) + Math.pow(coordinates[1].y - coordinates[3].y, 2));
+        double height = Math.max(h1, h2);
+
+        Point p0 = new Point(0,0);
+        Point p1 = new Point(width -1,0);
+        Point p2 = new Point(0, height -1);
+        Point p3 = new Point(width -1, height -1);
+        MatOfPoint2f src = new MatOfPoint2f(coordinates[0], coordinates[1], coordinates[2], coordinates[3]);
+        MatOfPoint2f dst= new MatOfPoint2f(p0, p1, p2, p3);
+        Mat M = Imgproc.getPerspectiveTransform(src, dst);
+        Imgproc.warpPerspective(img, img, M, img.size());
+    }
+
+    public void correction(Mat img) {
+        // find outermost contours
+        List<MatOfPoint> contours = new ArrayList<>();
+        Mat hierarchy = new Mat();
+        Imgproc.findContours(img, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+
+        // find the contour we want (the one with largest area)
+        double maxArea = 0.0;
+        MatOfPoint sudokuContor = contours.get(0);
+        for (int i = 0; i < contours.size(); i++) {
+            double area = Imgproc.contourArea(contours.get(i));
+            if(area > maxArea) {
+                maxArea = area;
+                sudokuContor = contours.get(i);
+            }
+        }
+
+        // use mask to clean up the area outside the contour
+        Scalar colorTOP = new Scalar(255);
+        Scalar colorBOT = new Scalar(0);
+        List<MatOfPoint> draw = new ArrayList<>();
+        draw.add(sudokuContor);
+        Mat mask = new Mat(mGray.rows(), mGray.cols(), mGray.type());
+        Imgproc.drawContours(mask, draw, 0, colorTOP, -1);
+        Imgproc.drawContours(mask, draw, 0, colorBOT, 2);
+        Core.bitwise_and(img, mask, img);
+
+        // use the outermost contour to recover the img
+        MatOfPoint2f toApprox = new MatOfPoint2f(sudokuContor.toArray());
+        double peri = Imgproc.arcLength(toApprox, true);
+        Imgproc.approxPolyDP(toApprox, toApprox,0.01 * peri, true);
+
+        if(toApprox.rows() != 4)
+            return;
+        Point[] rect = new Point[4];
+        Point[] sortedPoints = new Point[4];
+        double[] data;
+        for(int i=0; i<4; i++){
+            data = toApprox.get(i, 0);
+            rect[i] = new Point(data[0], data[1]);
+        }
+        coordinateUnpack(rect, sortedPoints);
+        harmongraphyMatrix(img, sortedPoints);
+        hierarchy.release();
+        mask.release();
+        return;
+    }
     // OpenCV Camera Functionality Code
     @Override
     public void onCameraViewStarted(int width, int height) {
@@ -215,7 +316,8 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
     public void onCameraViewStopped() {
         mRgba.release();
         mGray.release();
-        imgThresh.release();
+        imgDisplay.release();
+        temp.release();
     }
 
     @Override
@@ -237,33 +339,23 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
         else if(stateFlag == 0){
             // transition state
             // do nothing rn
-            stateFlag = 1;
-            return mRgba;
-        }
-        else{
-            // filtering state
-            Mat imgMedian = new Mat(mGray.rows(), mGray.cols(), mGray.type());
-            Mat imgGaussian = new Mat(mGray.rows(), mGray.cols(), mGray.type());
-            imgThresh = new Mat(mGray.rows(), mGray.cols(), mGray.type());
-            //Applying GaussianBlur on the Image
-            Imgproc.medianBlur(mGray, imgMedian,1);
-            Imgproc.GaussianBlur(imgMedian, imgGaussian, new Size(3, 3), 0);
-            Imgproc.adaptiveThreshold(imgGaussian, imgThresh, 255, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY_INV, 11, 7);
-            imgMedian.release();
-            imgGaussian.release();
+            filtering(mGray);
+            correction(imgDisplay);
             boolean pass = true;
             // if cannot locate grid
             if(!pass){
                 double fps = Core.getTickFrequency() / (Core.getTickCount()-start);
-                Imgproc.putText(mRgba, "FPS@"+fps, new Point(1000, 30), 3, 1, new Scalar(0,0,255), 2);
                 Imgproc.putText(mRgba, "Tracking Failure Occurred", new Point(10, 30), 3, 1, new Scalar(0,0,255), 2);
                 return mRgba;
             }
 
             // create FPS readings
-            double fps = Core.getTickFrequency() / (Core.getTickCount()-start);
-            Imgproc.putText(imgThresh, "FPS@"+fps, new Point(1000, 30), 3, 1, new Scalar(255), 2);
-            return imgThresh;
+            stateFlag = 1;
+            return imgDisplay;
+        }
+        else{
+            // filtering state
+            return imgDisplay;
         }
     }
 }
